@@ -226,6 +226,7 @@ int main(int argc, char **argv)
     struct timeval timeout;
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
 
     // check command line arguments
     if (argc < 3) {
