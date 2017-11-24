@@ -35,7 +35,8 @@
 #include <fcntl.h>
 
 
-#define NEXTSEQ(seq) ((seq) == 65535 ? 0 : (seq) + 1)
+char *onconnect = NULL;
+char *ondisconnect = NULL;
 
 
 void error(char *msg)
@@ -44,6 +45,24 @@ void error(char *msg)
     exit(1);
 }
 
+void runhook(char *prog)
+{
+    char *argv[2];
+    pid_t pid = fork();
+
+    switch (pid) {
+        case -1:
+            fprintf(stderr, "exec failed, unable to fork: %s\n", strerror(errno));
+            return;
+        case 0:
+            argv[0] = prog;
+            argv[1] = NULL;
+            execvp(prog, argv);
+            fprintf(stderr, "execvp failed: %s\n", strerror(errno));
+            exit(1);
+        break;
+    }
+}
 
 void run(int sock, int pipefd)
 {
@@ -75,6 +94,10 @@ void run(int sock, int pipefd)
                 addr.sin_family = AF_UNSPEC;
                 if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
                     error("connect(AF_UNSPEC)");
+
+                // run disconnect hook
+                if (ondisconnect)
+                    runhook(ondisconnect);
 
                 continue;
             }
@@ -138,15 +161,28 @@ void run(int sock, int pipefd)
         data_size = size - metadata_size;
 
         if (connected) {
-            if (sequence > expected) {
-                fprintf(stderr, "out of order rtp packet: num %d, expected %d\n", sequence, expected);
-                expected = NEXTSEQ(sequence);
-            } else
-            if (sequence < expected) {
-                fprintf(stderr, "dropped rtp packet: num %d, expected %d\n", sequence, expected);
-                skip++;
-            } else
-                expected = NEXTSEQ(sequence);
+            if (sequence == expected) {
+                expected++;
+            } else {
+                // Check sequence overflow
+                long delta = (long) sequence - (long) expected;
+                long delta1 = delta + 0x10000L;
+                long delta2 = delta - 0x10000L;
+
+                if (labs(delta2) < labs(delta1))
+                    delta1 = delta2;
+
+                if (labs(delta1) < labs(delta))
+                    delta = delta1;
+
+                if (delta < 0) {
+                    fprintf(stderr, "dropped rtp packet: num %d, expected %d\n", sequence, expected);
+                    skip++;
+                } else {
+                    fprintf(stderr, "out of order rtp packet: num %d, expected %d\n", sequence, expected);
+                    expected = sequence + 1;
+                }
+            }
         } else {
             char peeraddr[64];
             unsigned peerport;
@@ -159,8 +195,12 @@ void run(int sock, int pipefd)
 
             fprintf(stderr, "RTP Stream connected from %s:%u, payload type %d\n", peeraddr, peerport, payload);
 
-            expected = NEXTSEQ(sequence);
-            connected = 1;
+            expected = sequence + 1;
+            // run connect hook
+            if (onconnect)
+                runhook(onconnect);
+
+            connected++;
         }
 
         if (skip)
@@ -170,7 +210,7 @@ void run(int sock, int pipefd)
         rv = write(pipefd, buffer + metadata_size, data_size);
         if (rv < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                fprintf(stderr, "pulseaudio pipe source overrun: num %u, timestamp %u, size %u\n", sequence, tstamp, (unsigned)data_size);
+                fprintf(stderr, "pulseaudio pipe source overrun: num %u, size %u\n", sequence, (unsigned)data_size);
                 continue;
             }
             error("pipe write");
@@ -189,7 +229,7 @@ int main(int argc, char **argv)
 
     // check command line arguments
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <port> <pulseaudio-pipe>\n", argv[0]);
+        fprintf(stderr, "usage: %s <port> <pulseaudio-pipe> [exec-on-connect] [exec-on-disconnect]\n", argv[0]);
         return 1;
     }
 
@@ -201,7 +241,7 @@ int main(int argc, char **argv)
     }
 
     // create listen socket
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sock < 0)
         error("socket");
 
@@ -220,15 +260,21 @@ int main(int argc, char **argv)
 
     // set receive timeout
     timeout.tv_sec = 0;
-    timeout.tv_usec = 500000; // 500 msec to reset stream counters
+    timeout.tv_usec = 500000; // 500 msec to disconnect
     if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
                    sizeof(timeout)) < 0)
         error("setsockopt failed");
 
     // open pipe
-    pipefd = open(argv[2], O_WRONLY | O_NONBLOCK);
+    pipefd = open(argv[2], O_WRONLY | O_NONBLOCK | O_CLOEXEC);
     if (pipefd < 0)
         error("pipe open");
+
+    // setup connect/disconnect handlers
+    if (argc > 3)
+        onconnect = strdup(argv[3]);
+    if (argc > 4)
+        ondisconnect = strdup(argv[4]);
 
     // run
     run(sock, pipefd);
